@@ -6,6 +6,7 @@ param(
   [Parameter(Mandatory=$true)][string]$Destination,
   [switch]$Mirror,
   [switch]$DeleteExtra,
+  [switch]$AllowEmptySource,
   [string]$QuarantineDir,
   [ValidateSet('SHA256','SHA384','SHA512')][string]$HashAlgorithm = 'SHA256'
 )
@@ -58,6 +59,10 @@ function Regular-Files([string]$root) {
 
 $sourceFiles = @(Regular-Files $srcRoot)
 $sourceIndex = @{}
+if ($Mirror -and $sourceFiles.Count -eq 0 -and -not $AllowEmptySource) {
+  throw 'Source contains no regular files; use -AllowEmptySource to mirror an intentionally empty source.'
+}
+
 foreach ($file in $sourceFiles) {
   $rel = Relative-Name $srcRoot $file.FullName
   $sourceIndex[$rel] = $true
