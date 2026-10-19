@@ -1,58 +1,115 @@
 # TABARC-Code
+# One-way file synchronisation. Mirror extras are quarantined unless -DeleteExtra is chosen.
+[CmdletBinding(SupportsShouldProcess=$true)]
 param(
   [Parameter(Mandatory=$true)][string]$Source,
   [Parameter(Mandatory=$true)][string]$Destination,
   [switch]$Mirror,
-  [string]$HashAlgorithm = "SHA256"
+  [switch]$DeleteExtra,
+  [string]$QuarantineDir,
+  [ValidateSet('SHA256','SHA384','SHA512')][string]$HashAlgorithm = 'SHA256'
 )
 
-$Source = (Resolve-Path -LiteralPath $Source).Path
-if (-not (Test-Path -LiteralPath $Destination)) { New-Item -ItemType Directory -Path $Destination -Force | Out-Null }
-$Destination = (Resolve-Path -LiteralPath $Destination).Path
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
 
-function RelPath([string]$root,[string]$full) {
-  $r = $root.TrimEnd('\') + '\'
-  if ($full.StartsWith($r,[StringComparison]::OrdinalIgnoreCase)) { $full.Substring($r.Length) } else { $full }
+if ($DeleteExtra -and -not $Mirror) { throw '-DeleteExtra requires -Mirror.' }
+$srcRoot = (Resolve-Path -LiteralPath $Source -ErrorAction Stop).ProviderPath
+if (-not (Test-Path -LiteralPath $srcRoot -PathType Container)) { throw 'Source must be a directory.' }
+$dstRoot = [IO.Path]::GetFullPath($Destination)
+$srcRoot = [IO.Path]::GetFullPath($srcRoot)
+$srcPrefix = $srcRoot.TrimEnd('\') + '\'
+$dstPrefix = $dstRoot.TrimEnd('\') + '\'
+
+if ([string]::Equals($srcRoot.TrimEnd('\'),$dstRoot.TrimEnd('\'),[StringComparison]::OrdinalIgnoreCase) -or
+    $srcRoot.StartsWith($dstPrefix,[StringComparison]::OrdinalIgnoreCase) -or
+    $dstRoot.StartsWith($srcPrefix,[StringComparison]::OrdinalIgnoreCase)) {
+  throw 'Source and destination must be separate, non-overlapping directory trees.'
 }
 
-$srcFiles = Get-ChildItem -LiteralPath $Source -Recurse -File -Force
-$dstIndex = Get-ChildItem -LiteralPath $Destination -Recurse -File -Force | ForEach-Object {
-  [pscustomobject]@{ Rel = (RelPath $Destination $_.FullName); Full = $_.FullName; Len = $_.Length }
-} | Group-Object Rel -AsHashTable -AsString
+if ($QuarantineDir) {
+  $quarantineRoot = [IO.Path]::GetFullPath($QuarantineDir)
+} else {
+  $parent = Split-Path -Parent $dstRoot
+  $quarantineRoot = Join-Path $parent ('.' + (Split-Path -Leaf $dstRoot) + '-sync-quarantine')
+}
+$quarantinePrefix = $quarantineRoot.TrimEnd('\') + '\'
+if ($Mirror -and -not $DeleteExtra -and (
+    [string]::Equals($quarantineRoot.TrimEnd('\'),$srcRoot.TrimEnd('\'),[StringComparison]::OrdinalIgnoreCase) -or
+    [string]::Equals($quarantineRoot.TrimEnd('\'),$dstRoot.TrimEnd('\'),[StringComparison]::OrdinalIgnoreCase) -or
+    $quarantineRoot.StartsWith($srcPrefix,[StringComparison]::OrdinalIgnoreCase) -or
+    $quarantineRoot.StartsWith($dstPrefix,[StringComparison]::OrdinalIgnoreCase) -or
+    $srcRoot.StartsWith($quarantinePrefix,[StringComparison]::OrdinalIgnoreCase) -or
+    $dstRoot.StartsWith($quarantinePrefix,[StringComparison]::OrdinalIgnoreCase)
+  )) { throw 'Quarantine must be outside source and destination directory trees.' }
 
-foreach ($f in $srcFiles) {
-  $rel = RelPath $Source $f.FullName
-  $dstPath = Join-Path $Destination $rel
-  $dstDir = Split-Path -Parent $dstPath
-  if (-not (Test-Path -LiteralPath $dstDir)) { New-Item -ItemType Directory -Path $dstDir -Force | Out-Null }
+function Relative-Name([string]$root,[string]$full) {
+  $prefix = $root.TrimEnd('\') + '\'
+  if (-not $full.StartsWith($prefix,[StringComparison]::OrdinalIgnoreCase)) {
+    throw "File outside sync root: $full"
+  }
+  return $full.Substring($prefix.Length)
+}
+function Regular-Files([string]$root) {
+  if (-not (Test-Path -LiteralPath $root -PathType Container)) { return @() }
+  @(Get-ChildItem -LiteralPath $root -File -Recurse -Force -ErrorAction Stop |
+    Where-Object { -not ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) })
+}
 
+$sourceFiles = @(Regular-Files $srcRoot)
+$sourceIndex = @{}
+foreach ($file in $sourceFiles) {
+  $rel = Relative-Name $srcRoot $file.FullName
+  $sourceIndex[$rel] = $true
+}
+
+foreach ($file in $sourceFiles) {
+  $rel = Relative-Name $srcRoot $file.FullName
+  $target = Join-Path $dstRoot $rel
   $copy = $true
-  if ($dstIndex.ContainsKey($rel)) {
-    $d = $dstIndex[$rel][0]
-    if ($d.Len -eq $f.Length) {
-      $h1 = (Get-FileHash -LiteralPath $f.FullName -Algorithm $HashAlgorithm).Hash
-      $h2 = (Get-FileHash -LiteralPath $d.Full -Algorithm $HashAlgorithm).Hash
-      if ($h1 -eq $h2) { $copy = $false }
+  if (Test-Path -LiteralPath $target -PathType Leaf) {
+    $existing = Get-Item -LiteralPath $target -Force
+    if ($existing.Length -eq $file.Length -and
+        (Get-FileHash -LiteralPath $file.FullName -Algorithm $HashAlgorithm).Hash -eq
+        (Get-FileHash -LiteralPath $target -Algorithm $HashAlgorithm).Hash) {
+      $copy = $false
     }
   }
-
-  if ($copy) {
-    Write-Host "Copying $rel"
-    Copy-Item -LiteralPath $f.FullName -Destination $dstPath -Force
+  if (-not $copy) { continue }
+  if ($PSCmdlet.ShouldProcess($target,"Copy $rel")) {
+    $parent = Split-Path -Parent $target
+    if (-not (Test-Path -LiteralPath $parent)) {
+      New-Item -ItemType Directory -Path $parent -Force | Out-Null
+    }
+    Copy-Item -LiteralPath $file.FullName -Destination $target -Force -ErrorAction Stop
+    $sourceHash = (Get-FileHash -LiteralPath $file.FullName -Algorithm $HashAlgorithm).Hash
+    $targetHash = (Get-FileHash -LiteralPath $target -Algorithm $HashAlgorithm).Hash
+    if ($sourceHash -ne $targetHash) { throw "Copy verification failed: $rel" }
+    Write-Host "Copied: $rel"
   }
 }
 
 if ($Mirror) {
-  $srcSet = @{}
-  foreach ($f in $srcFiles) { $srcSet[(RelPath $Source $f.FullName)] = $true }
-
-  Get-ChildItem -LiteralPath $Destination -Recurse -File -Force | ForEach-Object {
-    $rel = RelPath $Destination $_.FullName
-    if (-not $srcSet.ContainsKey($rel)) {
-      Write-Host "Removing $rel"
-      Remove-Item -LiteralPath $_.FullName -Force
+  $stamp = Get-Date -Format 'yyyyMMdd_HHmmss_fffffff'
+  foreach ($file in @(Regular-Files $dstRoot)) {
+    $rel = Relative-Name $dstRoot $file.FullName
+    if ($sourceIndex.ContainsKey($rel)) { continue }
+    if ($DeleteExtra) {
+      if ($PSCmdlet.ShouldProcess($file.FullName,"Permanently remove extra file $rel")) {
+        Remove-Item -LiteralPath $file.FullName -Force -ErrorAction Stop
+        Write-Host "Deleted: $rel"
+      }
+    } else {
+      $safeTarget = Join-Path (Join-Path $quarantineRoot $stamp) $rel
+      if ($PSCmdlet.ShouldProcess($file.FullName,"Quarantine extra file to $safeTarget")) {
+        $parent = Split-Path -Parent $safeTarget
+        if (-not (Test-Path -LiteralPath $parent)) {
+          New-Item -ItemType Directory -Path $parent -Force | Out-Null
+        }
+        Move-Item -LiteralPath $file.FullName -Destination $safeTarget -ErrorAction Stop
+        Write-Host "Quarantined: $rel"
+      }
     }
   }
 }
-
-Write-Host "Done."
+Write-Host 'Sync complete.'
