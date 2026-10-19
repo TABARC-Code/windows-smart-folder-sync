@@ -1,23 +1,42 @@
-# windows-smart-folder-sync
-One-way synchronisation from Source to Destination using file hashing. Slower than timestamps, but far more reliable when clocks, copies, or tools lie.
+# Smart Folder Sync
 
-# Smart Folder Sync (PowerShell)
+One-way PowerShell synchronisation using SHA-256, SHA-384 or SHA-512 to distinguish identical files.
 
-One-way synchronisation from Source to Destination using file hashing.
-Slower than timestamps, but far more reliable when clocks, copies, or tools lie.
+Requires Windows PowerShell 5.1 or PowerShell 7+. Files are copied from source to destination; matching content is skipped.
 
-## Requirements
+## Commands
 
-- Windows
-- PowerShell 5.1 or PowerShell 7+
+Preview changes without writing or removing anything:
 
-## Usage
 
 ```powershell
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
-.\Smart-Folder-Sync.ps1 -Source "C:\Data" -Destination "D:\Backup\Data"
-Mirror mode (also removes destination files not present in source):
+.\Smart-Folder-Sync.ps1 -Source 'C:\Projects' -Destination 'D:\Backup\Projects' -Mirror -WhatIf
+```
 
-powershell
-Copy code
-.\Smart-Folder-Sync.ps1 -Source "C:\Data" -Destination "D:\Backup\Data" -Mirror
+Copy missing or changed files:
+
+
+```powershell
+.\Smart-Folder-Sync.ps1 -Source 'C:\Projects' -Destination 'D:\Backup\Projects'
+```
+
+Mirror the source. Files present only in the destination are moved to a timestamped quarantine directory outside the destination, rather than deleted:
+
+
+```powershell
+.\Smart-Folder-Sync.ps1 -Source 'C:\Projects' -Destination 'D:\Backup\Projects' -Mirror
+```
+
+To deliberately delete destination-only files permanently, add `-DeleteExtra` alongside `-Mirror`. To mirror an intentionally empty source, also add `-AllowEmptySource`.
+
+The default quarantine directory is a sibling of the destination, named `.<destination>-sync-quarantine`. Specify a different folder with `-QuarantineDir`.
+
+## Safety
+
+- Source and destination must be separate, non-overlapping trees.
+- `-WhatIf` is supported; preview destructive operations before applying them.
+- A copied file is checked against the source hash before continuing.
+- Symlink/reparse-point files are excluded from scanning. Test junction-heavy directory structures separately before trusting a mirror run.
+- This is **not** a versioned backup system. Copies may replace changed destination files. Maintain separate historical backups.
+- Avoid changing source files during a run. File locking and crash consistency are not guaranteed.
+- Mirror quarantine is on the destination's parent drive by default; ensure that drive has enough capacity.
